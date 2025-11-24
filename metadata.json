@@ -1,0 +1,5 @@
+{
+  "name": "DubAI - Video Voiceover Genius",
+  "description": "Upload a short video and let Gemini generate a synchronized dubbing track based on the content and your character instructions.",
+  "requestFramePermissions": []
+}
