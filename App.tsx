@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { VideoUploader } from './components/VideoUploader';
 import { DubbedPlayer } from './components/DubbedPlayer';
 import { generateDubbingTimeline } from './services/geminiService';
@@ -7,10 +7,20 @@ import { AppState, DubbingSegment } from './types';
 function App() {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [instructions, setInstructions] = useState<string>("");
+  
+  // Initialize from localStorage if available
+  const [instructions, setInstructions] = useState<string>(() => {
+    return localStorage.getItem('dubai_instructions') || "";
+  });
+
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [dubbingSegments, setDubbingSegments] = useState<DubbingSegment[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  // Persist instructions whenever they change
+  useEffect(() => {
+    localStorage.setItem('dubai_instructions', instructions);
+  }, [instructions]);
 
   const handleFileSelect = (file: File) => {
     // Limit to 20MB to ensure reliable API transmission without timeouts
