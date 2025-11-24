@@ -25,11 +25,12 @@ export const DubbedPlayer: React.FC<DubbedPlayerProps> = ({ videoUrl, segments }
   const triggeredSegmentsRef = useRef<Set<number>>(new Set());
   const activeSegmentIndexRef = useRef<number | null>(null);
   const isVideoPausedForDubRef = useRef(false);
+  const isExportingRef = useRef(false); // Ref to track export status in loops
 
   // --- Initialization & Audio Loading ---
 
   useEffect(() => {
-    // Initialize Audio Context on user interaction usually, but here on mount for simplicity
+    // Initialize Audio Context
     const initAudio = async () => {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new Ctx();
@@ -68,6 +69,39 @@ export const DubbedPlayer: React.FC<DubbedPlayerProps> = ({ videoUrl, segments }
 
   // --- Playback Controls ---
 
+  // Helper to safely resume audio context on iOS
+  const resumeAudioContext = async () => {
+    const ctx = audioContextRef.current;
+    if (!ctx) return;
+
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch (e) {
+        console.error("Failed to resume audio context", e);
+      }
+    }
+    
+    // iOS Unlock Hack: Play a silent buffer to engage the audio engine
+    try {
+      const buffer = ctx.createBuffer(1, 1, 22050);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+    } catch (e) {
+      // Ignore errors if already unlocked
+    }
+  };
+
+  const togglePlay = async () => {
+    if (!isPlaying) {
+      // We are starting playback - MUST resume context here inside the click handler
+      await resumeAudioContext();
+    }
+    setIsPlaying(!isPlaying);
+  };
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -77,9 +111,8 @@ export const DubbedPlayer: React.FC<DubbedPlayerProps> = ({ videoUrl, segments }
         console.error("Video play failed", e);
         setIsPlaying(false);
       });
-      if (audioContextRef.current?.state === 'suspended') {
-        audioContextRef.current.resume();
-      }
+      // Note: We do NOT resume audioContext here anymore. 
+      // It must be done in the click handler (togglePlay) for iOS support.
     } else if (!isPlaying) {
       video.pause();
       stopAllAudio();
@@ -210,87 +243,117 @@ export const DubbedPlayer: React.FC<DubbedPlayerProps> = ({ videoUrl, segments }
   const handleExport = async () => {
     if (!videoRef.current || !audioContextRef.current || !destinationNodeRef.current) return;
     
+    // Ensure context is running for export too
+    await resumeAudioContext();
+
     setIsExporting(true);
+    isExportingRef.current = true;
     setIsPlaying(true);
     triggeredSegmentsRef.current.clear();
     stopAllAudio();
     
     const video = videoRef.current;
     
-    // Determine supported MIME type
-    const getSupportedMimeType = () => {
-      const types = [
-        'video/mp4;codecs=avc1,mp4a.40.2',
-        'video/mp4',
-        'video/webm;codecs=vp9,opus',
-        'video/webm'
-      ];
-      for (const type of types) {
-        if (MediaRecorder.isTypeSupported(type)) return type;
-      }
-      return 'video/webm'; // Fallback
-    };
+    // Canvas Workaround for iOS Safari (video.captureStream is often missing or buggy)
+    // We draw the video to a canvas and capture the canvas stream instead.
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext('2d');
     
-    const mimeType = getSupportedMimeType();
+    if (!ctx) {
+      alert("Browser does not support video capture.");
+      setIsExporting(false);
+      isExportingRef.current = false;
+      return;
+    }
+
+    // Drawing Loop to keep canvas synced with video
+    let animationFrameId: number;
+    const draw = () => {
+      if (!isExportingRef.current) return;
+      // Always draw the current frame, even if video is paused (Smart Pause)
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      animationFrameId = requestAnimationFrame(draw);
+    };
+    draw();
+    
+    // Determine supported MIME type (Safari prefers mp4)
+    let mimeType = 'video/webm';
+    if (typeof MediaRecorder.isTypeSupported === 'function') {
+      if (MediaRecorder.isTypeSupported('video/mp4')) {
+        mimeType = 'video/mp4';
+      } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+        mimeType = 'video/webm;codecs=vp9';
+      }
+    }
+    
     const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
     console.log(`Exporting using MIME type: ${mimeType}`);
 
-    // Capture the video stream
-    const videoStream = (video as any).captureStream ? (video as any).captureStream() : (video as any).mozCaptureStream();
-    const audioStream = destinationNodeRef.current.stream;
-    
-    // Combine tracks: Video from canvas/element + Audio from WebAudio destination
-    const combinedTracks = [
-      ...videoStream.getVideoTracks(),
-      ...audioStream.getAudioTracks()
-    ];
-    const combinedStream = new MediaStream(combinedTracks);
-    
-    const recorder = new MediaRecorder(combinedStream, {
-      mimeType: mimeType
-    });
-    
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunks.push(e.data);
-    };
-    
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: mimeType });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `dubbed_video.${ext}`;
-      a.click();
-      
-      setIsExporting(false);
-      setIsPlaying(false);
-      setExportProgress(0);
-      video.currentTime = 0; // Reset
-      video.muted = true; // Ensure original is muted
-      triggeredSegmentsRef.current.clear();
-    };
-
-    // Start recording
-    recorder.start();
-    
-    // Reset video to start and play
-    video.currentTime = 0;
-    video.muted = true; // Mute the video element output so it doesn't double up or feedback. The stream still captures audio from destinationNode.
-
     try {
-      await video.play();
-    } catch (e) {
-      console.error("Export play failed", e);
-      setIsExporting(false);
-    }
+      // Capture the canvas stream at 30 FPS
+      const canvasStream = (canvas as any).captureStream(30); 
+      const audioStream = destinationNodeRef.current.stream;
+      
+      const combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioStream.getAudioTracks()
+      ]);
+      
+      const recorder = new MediaRecorder(combinedStream, { mimeType });
+      const chunks: Blob[] = [];
+      
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      
+      recorder.onstop = () => {
+        cancelAnimationFrame(animationFrameId);
+        isExportingRef.current = false;
+        
+        const blob = new Blob(chunks, { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `dubbed_video.${ext}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        
+        setIsExporting(false);
+        setIsPlaying(false);
+        setExportProgress(0);
+        video.currentTime = 0; // Reset
+        video.muted = true; 
+        triggeredSegmentsRef.current.clear();
+      };
 
-    // We need to wait for video to end to stop recording
-    video.onended = () => {
-      recorder.stop();
-      // Remove this temporary listener
-      video.onended = () => setIsPlaying(false);
-    };
+      // Start recording
+      recorder.start();
+      
+      // Setup playback for recording
+      video.currentTime = 0;
+      video.muted = true; // Mute element to prevent double audio (stream has audio)
+
+      await video.play();
+
+      // Stop recording when video ends
+      // Note: use addEventListener to allow other onEnded handlers to persist if needed
+      const onEndedHandler = () => {
+        recorder.stop();
+        video.removeEventListener('ended', onEndedHandler);
+        setIsPlaying(false);
+      };
+      video.addEventListener('ended', onEndedHandler);
+
+    } catch (e) {
+      console.error("Export error:", e);
+      alert("Export failed. Your browser might not support MediaRecorder with video.");
+      setIsExporting(false);
+      isExportingRef.current = false;
+      cancelAnimationFrame(animationFrameId!);
+    }
   };
 
   return (
@@ -320,7 +383,7 @@ export const DubbedPlayer: React.FC<DubbedPlayerProps> = ({ videoUrl, segments }
         {!isPlaying && !isExporting && (
           <div 
             className="absolute inset-0 flex items-center justify-center bg-black/40 cursor-pointer transition-opacity hover:bg-black/30 z-20"
-            onClick={() => setIsPlaying(true)}
+            onClick={togglePlay}
           >
             <div className="w-16 h-16 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center border border-white/20 shadow-lg group-hover:scale-105 transition-transform">
               <svg className="w-8 h-8 text-white ml-1" fill="currentColor" viewBox="0 0 24 24">
@@ -364,7 +427,7 @@ export const DubbedPlayer: React.FC<DubbedPlayerProps> = ({ videoUrl, segments }
 
         <div className="flex items-center justify-between">
             <button 
-              onClick={() => setIsPlaying(!isPlaying)}
+              onClick={togglePlay}
               disabled={isExporting}
               className="text-white hover:text-emerald-400 transition-colors disabled:opacity-50"
             >
